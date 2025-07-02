@@ -1,0 +1,14 @@
+# RAG stack
+langchain==0.3.26
+langchain-community==0.3.26
+langchain-google-genai==2.1.6
+chromadb==1.0.13
+
+# Parsing PDF
+unstructured[pdf]==0.18.1
+
+# Google SDK (client Generative Language)
+google-ai-generativelanguage==0.6.18
+
+# Env
+python-dotenv==1.1.1

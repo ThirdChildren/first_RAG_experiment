@@ -1,0 +1,4 @@
+.venv/
+.env
+iso_index/
+ISO_pdf/
