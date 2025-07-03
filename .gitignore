@@ -1,4 +1,5 @@
 .venv/
 .env
-iso_index/
+iso_index_img/
+iso_index_txt/
 ISO_pdf/
