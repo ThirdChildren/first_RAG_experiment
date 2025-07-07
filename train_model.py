@@ -166,12 +166,21 @@ def caption_image_with_gemini(path: str) -> str:
         img_bytes = f.read()
     mime = f"image/{path.split('.')[-1].lower().replace('jpg','jpeg')}"
 
+    # PROMPT MIGLIORATO PER PIÙ DETTAGLI E STRUTTURA
     prompt = (
-        "Descrivi accuratamente questa immagine. "
-        "Se contiene un disegno tecnico, un diagramma, una tabella, un grafico o un'illustrazione, "
-        "identifica gli elementi principali, etichette, quote, valori numerici, relazioni testuali o tendenze. "
-        "Sii conciso ma completo, fornendo tutte le informazioni chiave che potrebbero essere utili per la comprensione del documento a cui l'immagine appartiene. "
-        "Rispondi in italiano. Non fare riferimento al fatto che è un'immagine, descrivine solo il contenuto."
+        "Sei un assistente specializzato nella descrizione dettagliata di immagini tecniche e scientifiche. "
+        "Fornisci una descrizione *esaustiva* e *strutturata* del contenuto di questa immagine. "
+        "Includi la didascalia originale dell'immagine se presente e distinguila dalla descrizione generata. "
+        "Identifica e descrivi tutti gli elementi principali e secondari visibili, i loro attributi "
+        "(es. forma, dimensioni, colore, materiale se implicito) e le loro relazioni spaziali. "
+        "Se l'immagine è un disegno tecnico, un diagramma, una tabella o un grafico, estrai i seguenti dettagli:\n"
+        "- **Titolo/Didascalia Implicita:** Se non c'è una didascalia esplicita, inferiscila dal contenuto visivo.\n"
+        "- **Elementi Chiave:** Elenca gli oggetti principali con i loro nomi (se visibili) e il loro ruolo.\n"
+        "- **Dettagli Numerici:** Riporta tutti i valori, quote, percentuali, intervalli di dati e unità di misura visibili.\n"
+        "- **Relazioni/Struttura:** Descrivi le connessioni, le gerarchie, le tendenze, i processi o il layout illustrati tra gli elementi.\n"
+        "- **Orientamento/Prospettiva:** Indica l'angolo di visione o la vista rappresentata (es. vista frontale, vista dall'alto, assonometrica).\n"
+        "Sii preciso, completo e organizzato usando elenchi puntati o numerati dove appropriato per facilitare la lettura. "
+        "Rispondi *solo* in italiano e non fare riferimento al fatto che stai descrivendo un'immagine, bensì il suo contenuto diretto."
     )
 
     parts = [
@@ -285,8 +294,6 @@ def main():
             "Risposta esaustiva e citata:"),
         input_variables=["context", "input"])
     
-    # Il document_prompt ora è un semplice PromptTemplate che userà la chiave 'source_info_full'
-    # che è già stata pre-formattata nei metadati di ogni Document.
     document_prompt = PromptTemplate(
         template="{page_content}\n(Source: {source_info_full})",
         input_variables=["page_content", "source_info_full"]
