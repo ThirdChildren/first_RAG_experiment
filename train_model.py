@@ -8,6 +8,8 @@ Multimodal RAG – v2025‑07
 Autore: Stefano Leto – refactor luglio 2025
 """
 import os, glob, hashlib, argparse, shutil, json, warnings
+import pandas as pd 
+import io # Importa io per StringIO, utile per pandas.read_html
 from typing import List, Optional
 
 # ── Disabilita telemetria LangChain ────────────────────────────────────────
@@ -83,25 +85,70 @@ def md5h(txt: str) -> str:
 # ── Estrattore PDF (testo + immagini in alta risoluzione) ─────────────────
 
 def load_pdf(pdf_path: str):
-    """Restituisce (chunks_testo, infos_immagini)"""
-    elements = partition_pdf(pdf_path, strategy="hi_res", infer_table_structure=True)
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-    chunks = splitter.split_text("\n".join(e.text for e in elements if e.text))
+    """Restituisce (chunks_testo, infos_immagini) con metadati più ricchi."""
+    
+    elements = partition_pdf(
+        pdf_path,
+        strategy="hi_res",
+        infer_table_structure=True,
+    )
 
-    pmap = {md5h(e.text): e.metadata.page_number for e in elements if e.text}
-    txt_docs = [{
-        "text": c,
-        "source": os.path.basename(pdf_path),
-        "page": pmap.get(md5h(c), "-")
-    } for c in chunks]
+    docs_from_elements = []
+    for e in elements:
+        if e.text:
+            metadata = {
+                "source": os.path.basename(pdf_path),
+                "page": e.metadata.page_number,
+                "type": e.category if hasattr(e, 'category') else str(type(e)).split('.')[-1].replace("'>", ""), 
+            }
+            
+            # Gestione robusta dell'header
+            header_str = ""
+            if hasattr(e.metadata, 'ancestor_paths') and e.metadata.ancestor_paths:
+                header_str = " > ".join(e.metadata.ancestor_paths)
+            elif metadata["type"] == "Title" and e.text: # Se è un titolo e ha testo, usiamo il suo testo
+                header_str = e.text
+            metadata["header"] = header_str if header_str else None # Assicurati che 'header' sia sempre presente, anche se None
+            
+            # Formatta la stringa completa delle informazioni sulla fonte
+            source_info = metadata.get('source', '-')
+            page_info = metadata.get('page', '-')
+            type_info = f", Type: {metadata['type']}" if metadata.get('type') else ""
+            header_for_source_info = f", Section: {metadata['header']}" if metadata.get('header') else ""
+            
+            # Aggiungi 'source_info_full' direttamente ai metadati
+            metadata["source_info_full"] = f"{source_info}, p.{page_info}{header_for_source_info}{type_info}"
+            
+            if e.metadata.text_as_html:
+                try:
+                    # Usa StringIO per passare l'HTML come una stringa-file a read_html
+                    df = pd.read_html(io.StringIO(e.metadata.text_as_html))[0]
+                    table_text = "Tabella:\n" + df.to_markdown(index=False)
+                    docs_from_elements.append(Document(page_content=table_text, metadata=metadata))
+                except Exception as ex:
+                    warnings.warn(f"Failed to parse table HTML from {pdf_path} (page {e.metadata.page_number}): {ex}")
+                    docs_from_elements.append(Document(page_content=e.text, metadata=metadata)) # Fallback
+            else:
+                docs_from_elements.append(Document(page_content=e.text, metadata=metadata))
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    final_txt_chunks = splitter.split_documents(docs_from_elements)
+
+    txt_docs = []
+    for doc in final_txt_chunks:
+        new_metadata = doc.metadata.copy()
+        new_metadata["text_chunk_hash"] = md5h(doc.page_content) 
+        txt_docs.append({
+            "text": doc.page_content,
+            **new_metadata
+        })
 
     import fitz  # PyMuPDF
     img_infos = []
     doc = fitz.open(pdf_path)
     for page_index in range(len(doc)):
         page = doc[page_index]
-        # rasterizza l'intera pagina a 300 dpi (leggibilità quote)
-        pix = page.get_pixmap(dpi=300)  # chiave: alta risoluzione
+        pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72))
         img_path = f"{os.path.splitext(pdf_path)[0]}_p{page_index+1}.png"
         pix.save(img_path)
         img_infos.append({
@@ -112,7 +159,7 @@ def load_pdf(pdf_path: str):
     doc.close()
     return txt_docs, img_infos
 
-# ── Caption immagini con Gemini (JSON) ─────────────────────────────────────
+# ── Caption immagini con Gemini (Descrizione generale migliorata) ─────────────────────────────────────
 
 def caption_image_with_gemini(path: str) -> str:
     with open(path, "rb") as f:
@@ -120,10 +167,11 @@ def caption_image_with_gemini(path: str) -> str:
     mime = f"image/{path.split('.')[-1].lower().replace('jpg','jpeg')}"
 
     prompt = (
-        "Leggi il disegno tecnico e restituisci un oggetto JSON con 3 campi:\n"
-        "labels: elenco di tutte le etichette di quota (es. ['l1', 'l2', 'r']).\n"
-        "relations: elenco di relazioni testuali trovate (es. 'l5 = 0,5 × l4').\n"
-        "shape: breve descrizione in italiano (<30 parole)."
+        "Descrivi accuratamente questa immagine. "
+        "Se contiene un disegno tecnico, un diagramma, una tabella, un grafico o un'illustrazione, "
+        "identifica gli elementi principali, etichette, quote, valori numerici, relazioni testuali o tendenze. "
+        "Sii conciso ma completo, fornendo tutte le informazioni chiave che potrebbero essere utili per la comprensione del documento a cui l'immagine appartiene. "
+        "Rispondi in italiano. Non fare riferimento al fatto che è un'immagine, descrivine solo il contenuto."
     )
 
     parts = [
@@ -135,33 +183,21 @@ def caption_image_with_gemini(path: str) -> str:
         return resp.text.strip()
     except Exception as e:
         warnings.warn(f"Gemini caption failed on {path}: {e}")
-        return "{}"  # fallback JSON vuoto
+        return f"Descrizione non disponibile per l'immagine {os.path.basename(path)}. Errore: {e}"
 
-# ── Visual Question Answering (fallback) ───────────────────────────────────
+# ── Visual Question Answering (Funzione mantenuta ma fallback automatico rimosso) ───────────────────────────────────
 
-def ask_gemini_vqa(img_path: str, question: str) -> str:
-    with open(img_path, "rb") as f:
-        img_bytes = f.read()
-    mime = f"image/{img_path.split('.')[-1].lower().replace('jpg','jpeg')}"
-    parts = [
-        types.Part.from_bytes(data=img_bytes, mime_type=mime),
-        types.Part.from_text(text=question)
-    ]
-    resp = gi_client.models.generate_content(model="gemini-2.5-flash", contents=parts)
-    return resp.text.strip()
-
-# ── Hybrid retriever ───────────────────────────────────────────────────────
+# ── Hybrid retriever (Aumento k e metadati più ricchi) ───────────────────────────────────────────────────────
 class HybridRetriever(BaseRetriever):
     retrievers: List[BaseRetriever]
-    k: int = 10
+    k: int = 15 
 
     def _get_relevant_documents(self, query: str, **_) -> List[Document]:
         seen, docs = set(), []
         for r in self.retrievers:
-            # .invoke sostituisce get_relevant_documents da LC 0.1.46
             hits = r.invoke(query) if hasattr(r, "invoke") else r.get_relevant_documents(query)
             for d in hits:
-                uid = (d.metadata.get("source"), d.metadata.get("page"), d.page_content[:60])
+                uid = (d.metadata.get("source"), d.metadata.get("page"), d.metadata.get("text_chunk_hash", md5h(d.page_content[:60])))
                 if uid not in seen:
                     docs.append(d)
                     seen.add(uid)
@@ -170,28 +206,34 @@ class HybridRetriever(BaseRetriever):
 # ── CLI ────────────────────────────────────────────────────────────────────
 
 def build_index(pdf_dir: str, persist_dir: str, k: int):
-    # Pulizia
     for suf in ["_txt", "_img"]:
         shutil.rmtree(persist_dir + suf, ignore_errors=True)
 
     txt_docs, img_infos = [], []
-    for pdf in glob.glob(os.path.join(pdf_dir, "*.pdf")):
+    for pdf in glob.glob(os.path.join(pdf_dir, "**", "*.pdf"), recursive=True): 
+        print(f"Processing PDF: {pdf}")
         t, i = load_pdf(pdf)
         txt_docs.extend(t)
         img_infos.extend(i)
 
-    # Caption + JSON
     img_text_docs = []
     for info in img_infos:
+        print(f"Captioning image: {info['path']}")
         caption = caption_image_with_gemini(info["path"])
+        
+        # Aggiungi source_info_full anche per le caption delle immagini
+        source_info = info.get('source', '-')
+        page_info = info.get('page', '-')
+        # Le caption non hanno header o type specifici come testo del PDF, quindi li omettiamo qui
+        info["source_info_full"] = f"{source_info}, p.{page_info}, Type: Image Caption"
+        
+        info_with_caption_hash = info.copy()
+        info_with_caption_hash["text_chunk_hash"] = md5h(caption)
         img_text_docs.append({
             "text": caption,
-            "source": info["source"],
-            "page": info["page"],
-            "path": info["path"]  # per VQA fallback
+            **info_with_caption_hash
         })
 
-    # Vector store testo (PDF + caption)
     all_text_docs = txt_docs + img_text_docs
     txt_embed = HuggingFaceEmbeddings(
         model_name="BAAI/bge-base-en-v1.5",
@@ -200,12 +242,12 @@ def build_index(pdf_dir: str, persist_dir: str, k: int):
     vdb_txt = Chroma.from_texts(
         [d["text"] for d in all_text_docs],
         txt_embed,
-        metadatas=[{"source": d["source"], "page": d["page"], "path": d.get("path")}
+        metadatas=[{k: v for k, v in d.items() if k != "text"}
                    for d in all_text_docs],
         persist_directory=persist_dir + "_txt",
     )
+    print(f"Text DB built with {len(all_text_docs)} documents.")
 
-    # Vector store immagini (CLIP)
     clip_embed = CLIPEmbeddings()
     vdb_img = Chroma.from_texts(
         [i["path"] for i in img_infos],
@@ -213,6 +255,7 @@ def build_index(pdf_dir: str, persist_dir: str, k: int):
         metadatas=img_infos,
         persist_directory=persist_dir + "_img",
     )
+    print(f"Image DB built with {len(img_infos)} images.") 
 
     return vdb_txt, vdb_img
 
@@ -221,26 +264,40 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pdf_dir", required=True, help="Cartella PDF")
     ap.add_argument("--persist_dir", default="./iso_index", help="Path indice Chroma")
-    ap.add_argument("--k", type=int, default=10, help="Top‑k retrieval")
+    ap.add_argument("--k", type=int, default=15, help="Top‑k retrieval (documenti totali)") 
     args = ap.parse_args()
 
     vdb_txt, vdb_img = build_index(pdf_dir=args.pdf_dir, persist_dir=args.persist_dir, k=args.k)
 
-    # LLM Gemini per le risposte
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_KEY, temperature=0)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_KEY, temperature=0.1) 
 
-    # Prompting chain
     qa_prompt = PromptTemplate(
         template=(
-            "Usa solo il contesto (passaggi testuali o caption) per rispondere. "
-            "Cita file & pagina.\n\n{context}\n\nQ: {input}\nA:"),
+            "Sei un assistente esperto in standard tecnici e studi scientifici sui parastinchi. "
+            "Rispondi alla domanda usando *esclusivamente* il contesto fornito. "
+            "Sii il più esaustivo possibile nell'estrarre i dettagli pertinenti. "
+            "Se la risposta non è presente nel contesto, o se il contesto è insufficiente per rispondere in modo completo, "
+            "dichiara chiaramente 'Le informazioni richieste non sono disponibili nel contesto fornito in modo completo.' "
+            "Cita sempre il nome del file e il numero di pagina per ogni informazione estratta dal contesto. "
+            "Per le tabelle o elenchi puntati, estrai tutti i dettagli rilevanti e presentali in un formato chiaro (es. elenco puntato o testo continuo). \n\n"
+            "Contesto:\n{context}\n\n"
+            "Domanda: {input}\n"
+            "Risposta esaustiva e citata:"),
         input_variables=["context", "input"])
-    doc_prompt = PromptTemplate(
-        template="{page_content}\n(Source: {source}, p.{page})",
-        input_variables=["page_content", "source", "page"])
+    
+    # Il document_prompt ora è un semplice PromptTemplate che userà la chiave 'source_info_full'
+    # che è già stata pre-formattata nei metadati di ogni Document.
+    document_prompt = PromptTemplate(
+        template="{page_content}\n(Source: {source_info_full})",
+        input_variables=["page_content", "source_info_full"]
+    )
 
-    combine_chain = create_stuff_documents_chain(llm=llm, prompt=qa_prompt, document_prompt=doc_prompt)
-
+    combine_chain = create_stuff_documents_chain(
+        llm=llm, 
+        prompt=qa_prompt, 
+        document_prompt=document_prompt 
+    )
+    
     hybrid = HybridRetriever(retrievers=[
         vdb_txt.as_retriever(search_kwargs={"k": args.k}),
         vdb_img.as_retriever(search_kwargs={"k": 3})
@@ -254,25 +311,14 @@ def main():
         if not q:
             break
 
-        # 1. standard RAG
         res = rag.invoke({"input": q})
         answer = res["answer"].strip()
 
-        # 2. fallback VQA se la risposta menziona "non" + immagini CLIP correlate
-        if "non" in answer.lower():
-            clip_hits: List[Document] = vdb_img.similarity_search(query=q, k=2)
-            for doc in clip_hits:
-                vqa_ans = ask_gemini_vqa(doc.metadata["path"], q)
-                if vqa_ans and "non posso" not in vqa_ans.lower():
-                    answer = vqa_ans + f"\n\n(Source VQA: {doc.metadata['source']} p.{doc.metadata['page']})"
-                    res["context"].append(doc)
-                    break
-
-        # Output
+        # Output delle fonti: estrai 'source_info_full' direttamente dai metadati
         print("\n▸ Risposta:\n", answer, "\n▸ Fonti:")
         for d in res["context"]:
-            m = d.metadata
-            print(f"  • {m.get('source','-')} (pag.{m.get('page','-')})")
+            source_info_full = d.metadata.get('source_info_full', f"{d.metadata.get('source', '-')}, p.{d.metadata.get('page', '-')}")
+            print(f"  • {d.page_content[:100]}... (Source: {source_info_full})")
 
 
 if __name__ == "__main__":
